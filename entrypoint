@@ -1,0 +1,255 @@
+# Building Fast API
+
+# In Azure VM
+1. Create gpt.api directory
+
+2. Create Fast API server in nano.py
+sudo nano app.py
+
+ rom fastapi import FastAPI, HTTPException
+import httpx
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Optional
+import logging
+import asyncio  # Added for async sleep
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",  # Update if needed
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+api_key = ""
+assistant_id = "asst_zFAJcadaPx2y8HzyR29ASNDQ"  # New assistant ID
+
+headers = {
+    "Authorization": f"Bearer {api_key}",
+    "OpenAI-Beta": "assistants=v2"
+}
+
+run_finished_states = ["completed", "failed", "cancelled", "expired"]
+
+class RunStatus(BaseModel):
+    run_id: str
+    thread_id: str
+    status: str
+    required_action: Optional[str]
+    last_error: Optional[str]
+
+class ThreadMessage(BaseModel):
+    content: str
+    role: str
+    hidden: bool
+    id: str
+    created_at: int
+
+class Thread(BaseModel):
+    messages: List[ThreadMessage]
+
+class CreateMessage(BaseModel):
+    content: str
+                       
+async def cancel_active_run(thread_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f'https://api.openai.com/v1/threads/{thread_id}/runs',
+                headers=headers
+            )
+            response.raise_for_status()
+            runs_data = response.json()
+            for run in runs_data['data']:
+                if run['status'] not in run_finished_states:
+                    try:
+                        cancel_response = await client.post(
+                            f'https://api.openai.com/v1/threads/{thread_id}/runs/{run["id"]}/cancel',
+                            headers=headers
+                        )
+                        cancel_response.raise_for_status()
+                        logging.info(f"Cancelled active run: {run['id']}")
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code == 400 and "Cannot cancel run with status 'completed'" in e.response.text:
+                            logging.info(f"Run already completed: {run['id']}")
+                        else:
+                            logging.error(f"HTTP error during run cancellation: {e.response.status_code} - {e.response.json()}")
+        except httpx.HTTPStatusError as e:
+            logging.error(f"HTTP error during run cancellation: {e.response.status_code} - {e.response.json()}")
+        except Exception as e:
+            logging.error(f"Error cancelling active run: {e}")
+
+
+@app.post("/api/new")
+async def post_new():
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                'https://api.openai.com/v1/threads',
+                headers=headers
+            )
+            response.raise_for_status()
+            thread_data = response.json()
+            
+            # Cancel any active runs on the new thread
+            await cancel_active_run(thread_data["id"])
+            
+            run_response = await client.post(
+                f'https://api.openai.com/v1/threads/{thread_data["id"]}/runs',
+                headers=headers,
+                json={"assistant_id": assistant_id}
+            )
+            run_response.raise_for_status()
+            run_data = run_response.json()
+            
+            # Wait for the run to complete
+            while True:
+                run_status_response = await client.get(
+                    f'https://api.openai.com/v1/threads/{thread_data["id"]}/runs/{run_data["id"]}',
+                    headers=headers
+                )
+                run_status_response.raise_for_status()
+                run_status_data = run_status_response.json()
+
+                if run_status_data['status'] in run_finished_states:
+                    break
+
+                await asyncio.sleep(1)  # Wait for 1 second before checking again
+
+            # Retrieve the best response from the run
+            messages_response = await client.get(
+                f'https://api.openai.com/v1/threads/{thread_data["id"]}/messages',
+                headers=headers
+            )
+            messages_response.raise_for_status()
+            messages_data = messages_response.json()
+
+            best_message = max(messages_data['data'], key=lambda msg: evaluate_message(msg))
+            content = "".join([part["text"]["value"] if isinstance(part, dict) and "text" in part else str(part) for part in best_message["content"]])
+
+            return {"run_id": run_data['id'], "thread_id": thread_data["id"], "response": content}
+
+        except httpx.HTTPStatusError as e:
+            logging.error(f"HTTP error: {e.response.status_code} - {e.response.json()}")
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.json())
+        except Exception as e:
+            logging.error(f"Error: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+def evaluate_message(message):
+    # Custom logic to evaluate the accuracy of the message
+    return "created by Aditya" in message["content"]
+
+@app.get("/api/threads/{thread_id}/runs/{run_id}")
+async def get_run(thread_id: str, run_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f'https://api.openai.com/v1/threads/{thread_id}/runs/{run_id}',
+                headers=headers
+            )
+            response.raise_for_status()
+            run_data = response.json()
+            return RunStatus(
+                run_id=run_data['id'],
+                thread_id=thread_id,
+                status=run_data['status'],
+                required_action=run_data.get('required_action'),
+                last_error=run_data.get('last_error')
+            )
+        except httpx.HTTPStatusError as e:
+            logging.error(f"HTTP error: {e.response.status_code} - {e.response.json()}")
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.json())
+        except Exception as e:
+            logging.error(f"Error: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@app.post("/api/threads/{thread_id}/runs/{run_id}/tool")
+async def post_tool(thread_id: str, run_id: str, tool_outputs: List[str]):
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f'https://api.openai.com/v1/threads/{thread_id}/runs/{run_id}/tool',
+                headers=headers,
+                json={"tool_outputs": tool_outputs}
+            )
+            response.raise_for_status()
+            run_data = response.json()
+            return RunStatus(
+                run_id=run_data['id'],
+                thread_id=thread_id,
+                status=run_data['status'],
+                required_action=run_data.get('required_action'),
+                last_error=run_data.get('last_error')
+            )
+        except httpx.HTTPStatusError as e:
+            logging.error(f"HTTP error: {e.response.status_code} - {e.response.json()}")
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.json())
+        except Exception as e:
+            logging.error(f"Error: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+                                                                                                     Modified  
+
+@app.post("/api/threads/{thread_id}")
+async def post_thread(thread_id: str, message: CreateMessage):
+    async with httpx.AsyncClient() as client:
+        try:
+            await cancel_active_run(thread_id)  # Ensure no active runs
+            await client.post(
+                f'https://api.openai.com/v1/threads/{thread_id}/messages',
+                headers=headers,
+                json={"content": message.content, "role": "user"}
+            )
+            run_response = await client.post(
+                f'https://api.openai.com/v1/threads/{thread_id}/runs',
+                headers=headers,
+                json={"assistant_id": assistant_id}
+            )
+            run_response.raise_for_status()
+            run_data = run_response.json()
+            
+            # Wait for the run to complete
+            while True:
+                run_status_response = await client.get(
+                    f'https://api.openai.com/v1/threads/{thread_id}/runs/{run_data["id"]}',
+                    headers=headers
+                )
+                run_status_response.raise_for_status()
+                run_status_data = run_status_response.json()
+
+                if run_status_data['status'] in run_finished_states:
+                    break
+
+                await asyncio.sleep(1)  # Wait for 1 second before checking again
+
+            # Retrieve the best response from the run
+            messages_response = await client.get(
+                f'https://api.openai.com/v1/threads/{thread_id}/messages',
+                headers=headers
+            )
+            messages_response.raise_for_status()
+            messages_data = messages_response.json()
+
+            best_message = max(messages_data['data'], key=lambda msg: evaluate_message(msg))
+            content = "".join([part["text"]["value"] if isinstance(part, dict) and "text" in part else str(part) for part in best_message["content"]])
+
+            return {"run_id": run_data['id'], "thread_id": thread_id, "response": content}
+
+        except httpx.HTTPStatusError as e:
+            logging.error(f"HTTP error: {e.response.status_code} - {e.response.json()}")
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.json())
+        except Exception as e:
+            logging.error(f"Error: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
